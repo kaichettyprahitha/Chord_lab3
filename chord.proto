@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package chord;
+
+option go_package = "./protocol";
+
+service Chord {
+
+    rpc Ping (PingRequest) returns (PingResponse) {}
+
+    rpc GetPredecessorAndSuccessors(GetPredecessorAndSuccessorsRequest) returns (GetPredecessorAndSuccessorsResponse);
+
+    rpc FindSuccessor(FindSuccessorRequest) returns (FindSuccessorResponse) {}
+
+    rpc Notify(NotifyRequest) returns (NotifyResponse);
+
+    rpc GetFile(GetFileRequest) returns (GetFileResponse) {}
+
+    rpc StoreFile(StoreFileRequest) returns (StoreFileResponse) {}
+
+    rpc ReplicateFile(ReplicateFileRequest) returns (ReplicateFileResponse) {}
+}
+
+message PingRequest {
+    // No request parameters needed for ping
+}
+
+message PingResponse {
+    // No response parameters needed for ping
+}
+//
+//message GetRequest {
+//    // Key to retrieve value
+//    string key = 1;
+//}
+//
+//message GetResponse {
+//    // Value corresponding to the key
+//    string value = 1;
+//}
+//
+//message PutRequest {
+//    // Key and value to be stored
+//    string key = 1;
+//    string value = 2;
+//}
+
+//message PutResponse {
+//    // No response needed for put
+//}
+//
+//message DeleteRequest {
+//    // Key to be deleted
+//    string key = 1;
+//}
+//
+//message DeleteResponse {
+//    // No response needed for delete
+//}
+
+message GetPredecessorAndSuccessorsRequest {}
+
+message GetPredecessorAndSuccessorsResponse {
+    string predecessor = 1;
+    repeated string successors = 2;
+}
+
+message FindSuccessorRequest {
+    string id = 1;
+}
+
+message FindSuccessorResponse {
+    bool found = 1;
+    string nextNode = 2;
+}
+
+message NotifyRequest {
+    string candidate = 1;
+}
+
+message NotifyResponse {}
+
+message GetFileRequest {
+    string fileName = 1;
+}
+
+message GetFileResponse {
+    bool found = 1;
+    string content = 2;
+    string nodeId = 3;
+    string nodeAddress = 4;
+    string nodePort = 5;
+}
+
+message StoreFileRequest {
+    string fileName = 1;
+    string content = 2;
+}
+
+message StoreFileResponse {
+    bool success = 1;
+}
+
+message ReplicateFileRequest {
+    string fileName = 1;
+    string content = 2;
+    int32 hopCount = 3;
+}
+
+message ReplicateFileResponse {
+    bool success = 1;
+}

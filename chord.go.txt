@@ -1,0 +1,600 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha1"
+	"flag"
+	"fmt"
+	"log"
+	"math/big"
+	"math/rand"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	pb "cs3410/chord/protocol"
+
+	"google.golang.org/grpc"
+)
+
+const (
+	defaultPort       = "3410"
+	successorListSize = 3
+	keySize           = sha1.Size * 8
+	maxLookupSteps    = 32
+)
+
+var (
+	two          = big.NewInt(2)
+	hashMod      = new(big.Int).Exp(big.NewInt(2), big.NewInt(keySize), nil)
+	localaddress string
+)
+
+// The main Node data structure that holds all state for this
+// node once it has joined a ring
+type Node struct {
+	pb.UnimplementedChordServer
+	mu sync.RWMutex
+
+	Address     string
+	Predecessor string
+	Successors  []string
+	FingerTable []string
+
+	Bucket map[string]string
+}
+
+//
+// Helper functions
+//
+
+// find our local IP address
+func init() {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	localaddress = localAddr.IP.String()
+
+	if localaddress == "" {
+		panic("init: failed to find non-loopback interface with valid address on this node")
+	}
+
+	log.Printf("found local address %s\n", localaddress)
+}
+
+// get the sha1 hash of a string as a bigint
+func hash(elt string) *big.Int {
+	hasher := sha1.New()
+	hasher.Write([]byte(elt))
+	return new(big.Int).SetBytes(hasher.Sum(nil))
+}
+
+// calculate the address of a point somewhere across the ring
+// this gets the target point for a given finger table entry
+// the successor of this point is the finger table entry
+func jump(address string, fingerentry int) *big.Int {
+	n := hash(address)
+
+	fingerentryminus1 := big.NewInt(int64(fingerentry) - 1)
+	distance := new(big.Int).Exp(two, fingerentryminus1, nil)
+
+	sum := new(big.Int).Add(n, distance)
+
+	return new(big.Int).Mod(sum, hashMod)
+}
+
+// returns true if elt is between start and end, accounting for the right
+// if inclusive is true, it can match the end
+func between(start, elt, end *big.Int, inclusive bool) bool {
+	if end.Cmp(start) > 0 {
+		return (start.Cmp(elt) < 0 && elt.Cmp(end) < 0) || (inclusive && elt.Cmp(end) == 0)
+	} else {
+		return start.Cmp(elt) < 0 || elt.Cmp(end) < 0 || (inclusive && elt.Cmp(end) == 0)
+	}
+}
+
+// TODO: find
+
+// Create the node object and all of the background processors
+func StartServer(port string, nprime string) (*Node, error) {
+	address := net.JoinHostPort(localaddress, port)
+
+	node := &Node{
+		Address:     address,
+		FingerTable: make([]string, keySize+1),
+		Predecessor: "",
+		Successors:  nil,
+		Bucket:      make(map[string]string),
+	}
+
+	// are we the first node?
+	if nprime == "" {
+		log.Print("StartServer: creating new ring")
+		node.Successors = []string{node.Address}
+	} else {
+		log.Print("StartServer: joining existing ring using ", nprime)
+
+		// TODO: find our successor using find
+		// ... but for now use the given address as our successor
+		node.Successors = []string{nprime}
+
+		// TODO: use a GetAll request to popular our bucket
+	}
+
+	//
+	// start listening for rpc calls
+	//
+	grpcServer := grpc.NewServer()
+
+	// Register our service implementation with the gRPC server
+	pb.RegisterChordServer(grpcServer, node)
+
+	// bind to the port
+	lis, err := net.Listen("tcp", node.Address)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	// Start the gRPC server
+	log.Printf("Starting to listen on %v", lis.Addr())
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("failed to serve: %v", err)
+		}
+	}()
+
+	// start running background tasks every second or so
+	go func() {
+		nextFinger := 0
+		for {
+			time.Sleep(time.Second / 3)
+			node.stabilize()
+
+			time.Sleep(time.Second / 3)
+			nextFinger = node.fixFingers(nextFinger)
+
+			time.Sleep(time.Second / 3)
+			node.checkPredecessor()
+		}
+	}()
+
+	return node, nil
+}
+
+//
+// All the methods that are called via RPC
+//
+
+func (n *Node) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
+	return &pb.PingResponse{}, nil
+}
+
+func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	value, exists := n.Bucket[req.Key]
+	if !exists {
+		log.Print("get: [", req.Key, "] miss")
+		return &pb.GetResponse{Value: ""}, nil
+	}
+	log.Print("get: [", req.Key, "] found [", value, "]")
+	return &pb.GetResponse{Value: value}, nil
+}
+
+func (n *Node) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	log.Print("put: [", req.Key, "] => [", req.Value, "]")
+	n.Bucket[req.Key] = req.Value
+	return &pb.PutResponse{}, nil
+}
+
+func (n *Node) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, exists := n.Bucket[req.Key]; exists {
+		log.Print("delete: found and deleted [", req.Key, "]")
+		delete(n.Bucket, req.Key)
+	} else {
+		log.Print("delete: not found [", req.Key, "]")
+	}
+	return &pb.DeleteResponse{}, nil
+}
+
+// TODO: GetAll
+// TODO: PutAll
+
+// TODO: FindSuccessor
+// TODO: GetPredecessor (really GetPredecessorAndSuccessors)
+// TODO: Notify
+
+//
+// Methods that are only used locally
+//
+
+func (node *Node) checkPredecessor() {
+	// TODO: checkPredecessor
+}
+
+func (node *Node) stabilize() {
+	// TODO: stabilize
+}
+
+func (node *Node) fixFingers(nextFinger int) int {
+	// TODO: fixFingers
+	nextFinger++
+	if nextFinger > keySize {
+		nextFinger = 1
+	}
+	return nextFinger
+}
+
+//
+// "client" stuff, starting with the shell
+//
+
+func shell(node *Node, port string, joinaddress string) {
+	log.Println()
+	log.Print("Starting interactive shell")
+	log.Print("Type \"help\" for a list of recognized commands")
+	log.Println()
+
+	ctx := context.Background()
+	in := bufio.NewScanner(os.Stdin)
+mainloop:
+	for in.Scan() {
+		// get a line of input
+		words := strings.Fields(in.Text())
+		if len(words) == 0 {
+			continue
+		}
+
+		switch words[0] {
+		case "port":
+			if len(words) == 1 {
+				log.Print("port: currently set to ", port)
+			} else if len(words) > 2 {
+				log.Print("port: supply a port number, or omit it to report current setting")
+			} else if node != nil {
+				log.Print("port: cannot change port after joining a ring")
+			} else {
+				port = words[1]
+				log.Print("port: set to ", port)
+			}
+		case "create":
+			if len(words) > 2 {
+				log.Print("create: optional port is only argument allowed")
+			} else if node != nil {
+				log.Print("create: already part of a ring; use quit to get out")
+			} else {
+				if len(words) == 2 {
+					port = words[1]
+					log.Print("create: port set to ", port)
+				}
+				var err error
+				if node, err = StartServer(port, ""); err != nil {
+					log.Print("create: failed to create node: ", err)
+					node = nil
+				}
+			}
+		case "join":
+			if len(words) > 2 {
+				log.Print("join: join address is the only argument expected")
+			} else if joinaddress == "" && len(words) == 1 {
+				log.Print("join: must supply address of existing ring")
+			} else if node != nil {
+				log.Print("join: already part of a ring; use quit to get out")
+			} else {
+				if len(words) == 2 {
+					joinaddress = words[1]
+				}
+				if strings.HasPrefix(joinaddress, ":") {
+					joinaddress = net.JoinHostPort(localaddress, joinaddress[1:])
+				} else if !strings.Contains(joinaddress, ":") {
+					joinaddress = net.JoinHostPort(joinaddress, port)
+				}
+				var err error
+				if node, err = StartServer(port, joinaddress); err != nil {
+					log.Print("join: failed to join node: ", err)
+					node = nil
+				}
+			}
+		case "dump":
+			if len(words) > 1 {
+				log.Print("dump: no arguments expected")
+			} else if node == nil {
+				log.Print("dump: not a member of a ring")
+			} else {
+				node.dump()
+			}
+		case "put":
+			if len(words) != 4 {
+				log.Print("put: must supply key, value, address, and nothing else")
+			} else if node == nil {
+				log.Print("put: not a member of a ring")
+			} else {
+				key, value, addr := words[1], words[2], words[3]
+				log.Print("put: sending request to node ", addr)
+				err := put_rpc(ctx, key, value, addr)
+				if err != nil {
+					log.Print("put: error in put call: ", err)
+				}
+			}
+
+		case "putrandom":
+			if len(words) != 2 {
+				log.Print("putrandom: must supply a number of random keys to put")
+			} else if node == nil {
+				log.Print("putrandom: not a member of a ring")
+			} else {
+				n, err := strconv.Atoi(words[1])
+				if err != nil {
+					log.Print("putrandom: failed to parse number: ", err)
+					continue
+				}
+				for i := 0; i < n; i++ {
+					// generate a random key of 5 letters
+					key := ""
+					for j := 0; j < 5; j++ {
+						key += fmt.Sprintf("%c", 'a'+rand.Intn(26))
+					}
+					value := "random(" + key + ")"
+					log.Print("putrandom: generated pair " + key + " => " + value)
+
+					// TODO: do a normal put with this key/value pair
+				}
+			}
+
+		case "get":
+			if len(words) != 3 {
+				log.Print("get: must supply key, address, and nothing else")
+			} else if node == nil {
+				log.Print("get: not a member of a ring")
+			} else {
+				key, addr := words[1], words[2]
+				log.Print("get: sending request to node ", addr)
+				value, err := get_rpc(ctx, key, addr)
+				if err != nil {
+					log.Print("get: error in remote call: ", err)
+				}
+				if value == "" {
+					log.Print("get: not found")
+				} else {
+					log.Print("get: found ", key, " => ", value)
+				}
+			}
+		case "delete":
+			if len(words) != 3 {
+				log.Print("delete: must supply key, address, and nothing else")
+			} else if node == nil {
+				log.Print("delete: not a member of a ring")
+			} else {
+				key, addr := words[1], words[2]
+				log.Print("delete: sending request to node ", addr)
+				err := delete_rpc(ctx, key, addr)
+				if err != nil {
+					log.Print("delete: error in remote call: ", err)
+				}
+			}
+		case "quit":
+			break mainloop
+		case "help":
+			fallthrough
+		default:
+			log.Print("commands: help, quit, port, create, join, dump, put, get, delete")
+		}
+	}
+	if err := in.Err(); err != nil {
+		log.Fatalf("scanning input: %v", err)
+	}
+
+	log.Print("quitting")
+
+	if node == nil {
+		log.Print("not part of a ring, nothing to clean up")
+		return
+	}
+
+	// TODO: send our key/value pairs to our successor using PutAll
+	// (unless we are the last node, then nothing to do)
+}
+
+// format an address for printing
+func addr(a string) string {
+	if a == "" {
+		return "(empty)"
+	}
+	s := fmt.Sprintf("%040x", hash(a))
+	return s[:8] + ".. (" + a + ")"
+}
+
+// print useful info about the local node
+func (n *Node) dump() {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	log.Println()
+	log.Print("dump: information about this node")
+
+	// predecessor and successor links
+	log.Print("Neighborhood")
+	log.Print("pred:   ", addr(n.Predecessor))
+	log.Print("self:   ", addr(n.Address))
+	for i, succ := range n.Successors {
+		log.Printf("succ %d: %s", i, addr(succ))
+	}
+	log.Println()
+	log.Print("Finger table")
+	i := 1
+	for i <= keySize {
+		for i < keySize && n.FingerTable[i] == n.FingerTable[i+1] {
+			i++
+		}
+		log.Printf(" [%3d]: %s", i, addr(n.FingerTable[i]))
+		i++
+	}
+	log.Println()
+	log.Print("Data items")
+	for k, v := range n.Bucket {
+		s := fmt.Sprintf("%040x", hash(k))
+		log.Printf("    %s.. %s => %s", s[:8], string(k), v)
+	}
+	log.Println()
+}
+
+//
+// Client RPC helpers
+//
+
+func ping_rpc(ctx context.Context, addr string) error {
+	// Establish a new gRPC connection
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Create a new gRPC client
+	client := pb.NewChordClient(conn)
+
+	// Call the Ping RPC method
+	_, err = client.Ping(ctx, &pb.PingRequest{})
+	return err
+}
+
+func put_rpc(ctx context.Context, key, value string, addr string) error {
+	// Establish a new gRPC connection
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Create a new gRPC client
+	client := pb.NewChordClient(conn)
+
+	// Call the Put RPC method
+	_, err = client.Put(ctx, &pb.PutRequest{Key: key, Value: value})
+	return err
+}
+
+func get_rpc(ctx context.Context, key string, addr string) (string, error) {
+	// Establish a new gRPC connection
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	// Create a new gRPC client
+	client := pb.NewChordClient(conn)
+
+	// Call the Get RPC method
+	response, err := client.Get(ctx, &pb.GetRequest{Key: key})
+	if err != nil {
+		return "", err
+	}
+	return response.GetValue(), nil
+}
+
+func delete_rpc(ctx context.Context, key string, addr string) error {
+	// Establish a new gRPC connection
+	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Create a new gRPC client
+	client := pb.NewChordClient(conn)
+
+	// Call the Delete RPC method
+	_, err = client.Delete(ctx, &pb.DeleteRequest{Key: key})
+	return err
+}
+
+// TODO: get_all_rpc
+// TODO: put_all_rpc
+
+// TODO: find_successor_rpc
+// TODO: get_predecessor_and_successors_rpc
+// TODO: notify_rpc
+
+func main() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	var create, doshell bool
+	var port, joinaddress string
+	var dumpinterval int
+	var notime bool
+	flag.BoolVar(&notime, "notime", notime,
+		"Omit timestamp at the beginning of each output line")
+	flag.StringVar(&port, "port", defaultPort,
+		"Set the port for this node at address "+localaddress)
+	flag.BoolVar(&create, "create", false,
+		"Create a new ring")
+	flag.StringVar(&joinaddress, "join", "",
+		"Join an existing ring at given address (implies -create=false)")
+	flag.IntVar(&dumpinterval, "dump", -1,
+		"Dump status info every n seconds (<1 implies no periodic dumps)")
+	flag.BoolVar(&doshell, "shell", true,
+		"Start an interactive shell (implies dump=-1)")
+	flag.Parse()
+
+	if notime {
+		log.SetFlags(0)
+	}
+
+	// enforce implied options
+	if joinaddress != "" {
+		create = false
+	}
+	if doshell {
+		dumpinterval = -1
+	}
+
+	rand.Seed(time.Now().UnixNano())
+
+	log.Print("CS 3410: Distributed Systems")
+	log.Print("Chord Distributed Hash Table (DHT) Example Solution")
+	log.Print("by Russ Ross, March 2024")
+	log.Println()
+
+	var node *Node
+	var err error
+	if create || joinaddress != "" {
+		if strings.HasPrefix(joinaddress, ":") {
+			joinaddress = net.JoinHostPort(localaddress, joinaddress[1:])
+		} else if joinaddress != "" && !strings.Contains(joinaddress, ":") {
+			joinaddress = net.JoinHostPort(joinaddress, port)
+		}
+		if node, err = StartServer(port, joinaddress); err != nil {
+			log.Fatal("Failed creating node: ", err)
+		}
+	}
+	if dumpinterval >= 1 {
+		go func() {
+			for {
+				time.Sleep(time.Second * time.Duration(dumpinterval))
+				node.dump()
+			}
+		}()
+	}
+
+	if doshell {
+		shell(node, port, joinaddress)
+	} else {
+		log.Print("No interactive shell, main goroutine going to sleep")
+		for {
+			time.Sleep(time.Minute)
+		}
+	}
+}

@@ -1,0 +1,199 @@
+package main
+
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/rpc"
+	"time"
+	"lab3/"
+)
+
+type Node struct {
+	ID          string
+	IP          string
+	Port        int
+	Successor   *Node
+	FingerTable []*Node
+	Files       map[string]string
+}
+
+type Chord struct {
+	Node
+}
+
+// Utility function to hash strings using SHA1
+func hashString(s string) string {
+	h := sha1.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Start a new Chord ring
+func (c *Chord) create() {
+	c.Successor = &c.Node
+	log.Printf("Node %s created a new ring.\n", c.ID)
+}
+
+// Join an existing Chord ring
+func (c *Chord) join(existingNodeIP string, existingNodePort int) {
+	client, err := rpc.Dial("tcp", fmt.Sprintf("%s:%d", existingNodeIP, existingNodePort))
+	if err != nil {
+		log.Fatalf("Failed to join ring: %v", err)
+	}
+	defer client.Close()
+
+	var successor Node
+	err = client.Call("Chord.FindSuccessor", c.ID, &successor)
+	if err != nil {
+		log.Fatalf("Error finding successor: %v", err)
+	}
+
+	c.Successor = &successor
+	log.Printf("Node %s joined the ring via %s:%d.\n", c.ID, existingNodeIP, existingNodePort)
+}
+
+// Lookup command to find the successor of a key
+func (c *Chord) Lookup(key string) *Node {
+	hashedKey := hashString(key)
+	log.Printf("Looking up key %s (hash: %s)...", key, hashedKey)
+
+	if c.Successor.ID >= hashedKey || c.ID < hashedKey {
+		return c.Successor
+	}
+
+	// Forward the request to the successor
+	client, err := rpc.Dial("tcp", fmt.Sprintf("%s:%d", c.Successor.IP, c.Successor.Port))
+	if err != nil {
+		log.Fatalf("Error during lookup: %v", err)
+	}
+	defer client.Close()
+
+	var result Node
+	err = client.Call("Chord.Lookup", hashedKey, &result)
+	if err != nil {
+		log.Fatalf("Error finding key: %v", err)
+	}
+
+	return &result
+}
+
+// StoreFile stores a file on the correct node
+func (c *Chord) StoreFile(filePath string) {
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		log.Fatalf("Failed to read file: %v", err)
+	}
+
+	key := hashString(filePath)
+	node := c.Lookup(key)
+	if node.ID == c.ID {
+		c.Files[key] = string(data)
+		log.Printf("Stored file %s locally.\n", filePath)
+	} else {
+		client, err := rpc.Dial("tcp", fmt.Sprintf("%s:%d", node.IP, node.Port))
+		if err != nil {
+			log.Fatalf("Failed to store file: %v", err)
+		}
+		defer client.Close()
+
+		var reply string
+		err = client.Call("Chord.StoreFileRemote", struct {
+			Key  string
+			Data string
+		}{key, string(data)}, &reply)
+		if err != nil {
+			log.Fatalf("Error storing file remotely: %v", err)
+		}
+		log.Printf("File %s stored on node %s.\n", filePath, node.ID)
+	}
+}
+
+// PrintState prints the current node state
+func (c *Chord) PrintState() {
+	log.Printf("Node ID: %s, IP: %s, Port: %d\n", c.ID, c.IP, c.Port)
+	log.Println("Successor:")
+	log.Printf("  ID: %s, IP: %s, Port: %d\n", c.Successor.ID, c.Successor.IP, c.Successor.Port)
+	log.Println("Finger Table:")
+	for _, node := range c.FingerTable {
+		log.Printf("  ID: %s, IP: %s, Port: %d\n", node.ID, node.IP, node.Port)
+	}
+}
+
+// RPC handler for remote file storage
+func (c *Chord) StoreFileRemote(args struct {
+	Key  string
+	Data string
+}, reply *string) error {
+	c.Files[args.Key] = args.Data
+	*reply = "File stored successfully"
+	return nil
+}
+
+func main() {
+	// Parse command-line arguments
+	var ip, joinIP, id string
+	var port, joinPort, ts, tff, tcp, r int
+
+	flag.StringVar(&ip, "a", "", "IP address of the node")
+	flag.IntVar(&port, "p", 0, "Port of the node")
+	flag.StringVar(&joinIP, "ja", "", "IP address of the existing node to join")
+	flag.IntVar(&joinPort, "jp", 0, "Port of the existing node to join")
+	flag.IntVar(&ts, "ts", 0, "Time between stabilizations")
+	flag.IntVar(&tff, "tff", 0, "Time between fixing fingers")
+	flag.IntVar(&tcp, "tcp", 0, "Time between checking predecessor")
+	flag.IntVar(&r, "r", 0, "Number of successors to maintain")
+	flag.StringVar(&id, "i", "", "Override ID for the node")
+	flag.Parse()
+
+	fmt.Println(ip, port, joinIP, ts, tff, tcp, r, id)
+	// Ensure required arguments are present
+	if ip == "" || port == 0 {
+		log.Fatalf("IP and port must be specified.")
+	}
+
+	// Compute node ID if not provided
+	if id == "" {
+		id = hashString(fmt.Sprintf("%s:%d", ip, port))
+	}
+
+	node := &Chord{
+		Node{
+			ID:          id,
+			IP:          ip,
+			Port:        port,
+			Successor:   nil,
+			FingerTable: make([]*Node, 0),
+			Files:       make(map[string]string),
+		},
+	}
+
+	// Start a new ring or join an existing one
+	if joinIP == "" && joinPort == 0 {
+		node.create()
+	} else {
+		node.join(joinIP, joinPort)
+	}
+
+	// Start stabilization routines
+	go func() {
+		for {
+			time.Sleep(time.Duration(ts) * time.Millisecond)
+			log.Println("Stabilize routine")
+		}
+	}()
+
+	// Start RPC server
+	rpc.Register(node)
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", ip, port))
+	if err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+	defer listener.Close()
+	log.Printf("Node started at %s:%d\n", ip, port)
+	rpc.Accept(listener)
+}
